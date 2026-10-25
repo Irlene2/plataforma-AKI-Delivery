@@ -1,0 +1,18 @@
+{
+  "name": "delivery-platform-tooling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ferramental do monorepo: validação dos contratos em contracts/. Não é a aplicação — o backend é Java/Gradle em backend/ e o painel é Node em frontend/, cada um com o seu.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "contracts:openapi": "redocly lint contracts/openapi/*.json",
+    "contracts:events": "ajv compile -s \"contracts/events/*.json\" --spec=draft2020 --strict=true",
+    "contracts": "npm run contracts:openapi && npm run contracts:events"
+  },
+  "devDependencies": {
+    "@redocly/cli": "^2.46.2",
+    "ajv-cli": "^5.0.0"
+  }
+}

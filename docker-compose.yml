@@ -1,0 +1,396 @@
+# Perfis:
+#   core           infraestrutura (bancos, brokers, storage)
+#   services       gateway e microsserviços
+#   marco2         só o que o marco 2 usa: postgres, mongodb, rabbitmq, e identity,
+#                  merchant, catalog e gateway. É o perfil para subir a pilha — em
+#                  grupos, como diz o docs/como-subir-local.md (I-B)
+#   full           tudo
+#
+# No dia a dia você não sobe os nove aplicativos. Sobe `core` e roda pelo IDE
+# apenas o serviço em que está trabalhando:
+#   docker compose --profile core up -d
+#
+# ADR-021: oito serviços de negócio e um gateway. Mosquitto saiu junto com o
+# MQTT (ADR-020); a imagem do Postgres deixou de ser a do PostGIS pelo mesmo
+# motivo.
+
+name: delivery-platform
+
+services:
+
+  # ─────────────────────────────────────────────────────── core
+  postgres:
+    restart: unless-stopped
+    profiles: ["core", "marco2", "full"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    # ADR-014: seis serviços relacionais; o default de 100 conexões é apertado.
+    command: ["postgres", "-c", "max_connections=200"]
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/database/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Sem autenticação, por decisão. Habilitar auth num replica set exige --keyFile,
+  # que é um segredo em arquivo com permissão 400 — precisaria ser gerado pelo
+  # mongo-init e mantido fora do Git, e isso é complexidade de produção dentro de
+  # um compose de desenvolvimento. A porta liga em 127.0.0.1 (ver ports), que é o
+  # que remove a exposição. Se este compose um dia servir a algo além da máquina
+  # do desenvolvedor, isto vira decisão de novo — e aí é ADR.
+  mongodb:
+    restart: unless-stopped
+    profiles: ["core", "marco2", "full"]
+    image: mongo:8
+    # Replica set de nó único: sem ele não há transação multi-documento,
+    # e sem transação não há Outbox — ADR-008/ADR-017.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # restart: "no" é deliberado. Este contêiner inicializa o replica set e sai
+  # com 0 — é de um tiro só. Com unless-stopped ele reiniciaria para sempre,
+  # reexecutando o rs.initiate() a cada volta.
+  mongo-init:
+    profiles: ["core", "marco2", "full"]
+    image: mongo:8
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./infra/database/init/mongo-init-replicaset.sh:/init.sh:ro
+    entrypoint: ["sh", "/init.sh"]
+    restart: "no"
+
+  redis:
+    restart: unless-stopped
+    profiles: ["core", "full"]
+    image: redis:7-alpine
+    # AOF ligado: reiniciar o container não pode apagar estado de sessão ativo.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  rabbitmq:
+    restart: unless-stopped
+    profiles: ["core", "marco2", "full"]
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  minio:
+    restart: unless-stopped
+    profiles: ["core", "full"]
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9090:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ───────────────────────────────────────────────── aplicações
+
+  gateway:
+    profiles: ["services", "marco2", "full"]
+    build:
+      context: ./backend
+      dockerfile: infra/gateway/Dockerfile
+    environment:
+      # O JVM dimensiona o heap pelo limite do contêiner (mem_limit), e não pela
+      # VM inteira: sem o limite, cada um escolhia 1/4 da VM, ~2,9 GB (medido, I-B).
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+      SERVER_PORT: "8080"
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+      # Emissor e audiência: a MESMA expressão no identity (que assina), no
+      # merchant e no gateway (que conferem). `:-` e não `:`: um JWT_ISSUER=
+      # vazio no .env viraria string vazia, e o gateway recusaria todo token
+      # em silêncio. ADR-044 §3.
+      JWT_ISSUER: ${JWT_ISSUER:-http://localhost:8081}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-delivery-platform}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5500}
+      SERVICE_IDENTITY_URI: http://identity-service:8081
+      SERVICE_MERCHANT_URI: http://merchant-service:8082
+      SERVICE_CATALOG_URI: http://catalog-service:8083
+      SERVICE_SETTLEMENT_URI: http://settlement-service:8084
+      SERVICE_ORDER_URI: http://order-service:8085
+      SERVICE_PAYMENT_URI: http://payment-service:8086
+      SERVICE_DELIVERY_URI: http://delivery-service:8087
+      SERVICE_CONVERSATION_URI: http://conversation-service:8088
+    ports:
+      - "127.0.0.1:8080:8080"
+    # Três tentativas e para. Com unless-stopped, a queda da VM em 01/10 virou laço:
+    # ela religava as JVMs que tinham acabado de derrubá-la (I-B).
+    restart: "on-failure:3"
+    mem_limit: 512m
+
+  identity-service:
+    profiles: ["services", "marco2", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/identity-service/Dockerfile
+    environment:
+      # O JVM dimensiona o heap pelo limite do contêiner (mem_limit), e não pela
+      # VM inteira: sem o limite, cada um escolhia 1/4 da VM, ~2,9 GB (medido, I-B).
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+      SERVER_PORT: "8081"
+      DB_URL: jdbc:postgresql://postgres:5432/identity_db
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+      JWT_ISSUER: ${JWT_ISSUER:-http://localhost:8081}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-delivery-platform}
+      # A chave privada (ADR-037 §2: caminho de arquivo vindo do ambiente). Sem ela o
+      # JwtProperties recusa subir. O caminho é /run/segredos e não /run/secrets,
+      # que é o de `secrets:` do Docker — este compose não usa aquela seção.
+      JWT_PRIVATE_KEY_PATH: /run/segredos/jwt-private.pem
+      DELIVERY_SEMEADURA: ${DELIVERY_SEMEADURA:-false}
+      DELIVERY_SEMEADURA_SENHA: ${DELIVERY_SEMEADURA_SENHA:-}
+    volumes:
+      # O arquivo, e não a pasta, e somente leitura. A chave fica em secrets/,
+      # gitignorada; gere com o comando do .env.example.
+      - ./secrets/jwt-private.pem:/run/segredos/jwt-private.pem:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    # Três tentativas e para. Com unless-stopped, a queda da VM em 01/10 virou laço:
+    # ela religava as JVMs que tinham acabado de derrubá-la (I-B).
+    restart: "on-failure:3"
+    mem_limit: 512m
+
+  merchant-service:
+    profiles: ["services", "marco2", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/merchant-service/Dockerfile
+    environment:
+      # O JVM dimensiona o heap pelo limite do contêiner (mem_limit), e não pela
+      # VM inteira: sem o limite, cada um escolhia 1/4 da VM, ~2,9 GB (medido, I-B).
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+      DELIVERY_DOCS_ABERTAS: ${DELIVERY_DOCS_ABERTAS:-false}
+      DELIVERY_SEMEADURA: ${DELIVERY_SEMEADURA:-false}
+      SERVER_PORT: "8082"
+      DB_URL: jdbc:postgresql://postgres:5432/merchant_db
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+      JWT_ISSUER: ${JWT_ISSUER:-http://localhost:8081}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-delivery-platform}
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    # Três tentativas e para. Com unless-stopped, a queda da VM em 01/10 virou laço:
+    # ela religava as JVMs que tinham acabado de derrubá-la (I-B).
+    restart: "on-failure:3"
+    mem_limit: 512m
+
+  catalog-service:
+    profiles: ["services", "marco2", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/catalog-service/Dockerfile
+    environment:
+      # O JVM dimensiona o heap pelo limite do contêiner (mem_limit), e não pela
+      # VM inteira: sem o limite, cada um escolhia 1/4 da VM, ~2,9 GB (medido, I-B).
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+      DELIVERY_DOCS_ABERTAS: ${DELIVERY_DOCS_ABERTAS:-false}
+      DELIVERY_SEMEADURA: ${DELIVERY_SEMEADURA:-false}
+      SERVER_PORT: "8083"
+      MONGO_URI: mongodb://mongodb:27017/catalog_db?replicaSet=rs0
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+      JWT_ISSUER: ${JWT_ISSUER:-http://localhost:8081}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-delivery-platform}
+      MERCHANT_URI: http://merchant-service:8082
+    ports:
+      - "127.0.0.1:8083:8083"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    # Três tentativas e para. Com unless-stopped, a queda da VM em 01/10 virou laço:
+    # ela religava as JVMs que tinham acabado de derrubá-la (I-B).
+    restart: "on-failure:3"
+    mem_limit: 512m
+
+  settlement-service:
+    profiles: ["services", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/settlement-service/Dockerfile
+    environment:
+      SERVER_PORT: "8084"
+      DB_URL: jdbc:postgresql://postgres:5432/settlement_db
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+    ports:
+      - "127.0.0.1:8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  order-service:
+    profiles: ["services", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/order-service/Dockerfile
+    environment:
+      SERVER_PORT: "8085"
+      DB_URL: jdbc:postgresql://postgres:5432/order_db
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+    ports:
+      - "127.0.0.1:8085:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-service:
+    profiles: ["services", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/payment-service/Dockerfile
+    environment:
+      SERVER_PORT: "8086"
+      DB_URL: jdbc:postgresql://postgres:5432/payment_db
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+    ports:
+      - "127.0.0.1:8086:8086"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  delivery-service:
+    profiles: ["services", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/delivery-service/Dockerfile
+    environment:
+      SERVER_PORT: "8087"
+      DB_URL: jdbc:postgresql://postgres:5432/delivery_db
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+    ports:
+      - "127.0.0.1:8087:8087"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  conversation-service:
+    profiles: ["services", "full"]
+    build:
+      context: ./backend
+      dockerfile: services/conversation-service/Dockerfile
+    environment:
+      SERVER_PORT: "8088"
+      MONGO_URI: mongodb://mongodb:27017/conversation_db?replicaSet=rs0
+      RABBITMQ_ADDRESSES: rabbitmq:5672
+      RABBITMQ_USERNAME: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+    ports:
+      - "127.0.0.1:8088:8088"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mongo-data:
+  redis-data:
+  rabbitmq-data:
+  minio-data:
